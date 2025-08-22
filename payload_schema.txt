@@ -1,0 +1,84 @@
+payload = {
+    "action": "deploy",           # "deploy" | "dry_run"  → dry_run adds --check --diff
+    "persist": False,             # False | True          → True writes config to startup-config (breaks on cEOS)
+    "tags": ["base", "l2"],       # [], ["base"], ["l2"], ["persist"]  → run only these tagged tasks
+    "skip_tags": [],              # e.g. ["l2"] to skip L2 tasks even if present above
+    "devices": [
+        {
+            "name": "switch-core-1",      # inventory hostname (used for vault cred selection)
+            "ip": "192.0.2.10",           # eAPI host/IP
+            "port": 80,                  # eAPI TCP port (80 | 443 | 8080)
+            "interfaces": [
+                {
+                    "name": "Management0",
+                    "description": "OOB mgmt",        # optional
+                    "admin": "up",                  # "up" | "down" (optional; default "up")
+                    # NOTE: L2 keys (mode/vlan) are ignored on Management0 by the playbook.
+                    "speed": "auto",                # optional; "auto" or a rate like "1g", "10g", "25g", ...
+                },
+                {
+                    "name": "Ethernet3",
+                    "mode": "access",                 # "access" | "trunk"
+                    "vlan": 124,                      # access: int VLAN ID
+                    "description": "Camera 200",
+                    "admin": "down",                  # "up" | "down"
+                    "speed": "auto",                  # "auto" | "1g" | "10g" | "25g" | "40g" | "50g" | "100g" | ...
+                },
+                {
+                    "name": "Ethernet5",
+                    "mode": "trunk",                  # trunk requires a list of VLANs
+                    "vlan": [100, 200, 201, 200],     # trunk: list[int]; duplicates are OK (de-duplicated)
+                    "description": "Uplink to agg",
+                    "admin": "up",
+                    "speed": "10g",                   # optional on Ethernet*; omit or set "auto" if desired
+                },
+            ],
+        },
+        {
+            "name": "switch-edge-lon01",
+            "ip": "198.51.100.23",
+            "port": 80,                               # 80 | 443 | 8080 (match your EOS eAPI)
+            "interfaces": [
+                {
+                    "name": "Ethernet1",
+                    "mode": "access",
+                    "vlan": 10,
+                    "description": "Office AP",
+                    "speed": "1g",
+                },
+                {
+                    "name": "Port-Channel1",
+                    "mode": "trunk",
+                    "vlan": [10, 20, 30],
+                    "description": "MLAG peer link",
+                    # NOTE: speed is typically set on member links, not on the Port-Channel itself.
+                },
+                {
+                    "name": "Ethernet2",
+                    # No L2 fields → only base props will apply if present (desc/admin/speed on Ethernet*)
+                    "description": "Printer",
+                    "admin": "up",
+                },
+            ],
+        },
+        {
+            "name": "switch-lab-01",
+            "ip": "203.0.113.5",
+            "port": 8080,
+            "interfaces": [
+                {
+                    "name": "Ethernet10",
+                    "mode": "trunk",
+                    "vlan": [100, 200],               # can be empty list [] → trunk config is skipped by playbook
+                    "description": "Test trunk",
+                },
+                {
+                    "name": "Ethernet11",
+                    "mode": "access",
+                    "vlan": 200,
+                    "admin": "down",
+                },
+            ],
+        },
+    ],
+}

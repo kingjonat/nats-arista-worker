@@ -1,0 +1,267 @@
+# Apply common interface commands (desc/admin/speed) and simple L2 (access/trunk)
+# Works for one or many devices, and one or many interfaces per device.
+# Optional fields are optional.
+
+- name: Apply simple EOS interface config safely
+  hosts: all
+  connection: httpapi
+  gather_facts: no
+  collections: [arista.eos]
+  strategy: free     # run hosts independently; don’t block on slow boxes
+  serial: 25         # cap concurrency to 25 at a time
+
+  vars:
+    # HTTPAPI defaults
+    ansible_network_os: arista.eos.eos
+    ansible_httpapi_use_ssl: false
+    ansible_httpapi_validate_certs: false
+    ansible_connect_timeout: 5
+    ansible_command_timeout: 30
+
+    # Feature toggles
+    apply_l2: true   # set false to disable access/trunk config
+    persist: false   # OFF by default to cover cEOS (cEOS can return non-JSON on 'write memory')
+    preview_cli_always: false   # only emit CLI preview during --check by default
+
+
+  become: true
+  become_method: enable # enter privileged mode over eAPI (uses ansible_become_password)
+
+  pre_tasks:
+  # Accept 'interfaces' from either inventory hostvars or --extra-vars (CLI/NATS). Prefer hostvars if present.
+    - name: Bind interfaces input (from hostvars or extra-vars)
+      ansible.builtin.set_fact:
+        interfaces_effective: >-
+          {{ hostvars[inventory_hostname].interfaces
+             | default(interfaces | default([])) }}
+
+  # Quick preflight to prove eAPI connectivity & auth before any config
+    - name: Preflight - eAPI reachability/auth
+      arista.eos.eos_facts:
+
+  tasks:
+  # Build a minimal input for eos_interfaces:
+    # - description (if provided)
+    # - enabled (from admin up/down, if provided)
+    # - speed (including 'auto') ONLY on Ethernet*, not Mgmt or Port-Channel
+    - name: Build base config list for eos_interfaces
+      tags: [base]
+      ansible.builtin.set_fact:
+        _base_cfg: |
+          {% set out = [] %}
+          {% for i in interfaces_effective %}
+          {%   set item = {'name': i.name} %}
+          {%   if i.description is defined %}{% set _ = item.update({'description': i.description}) %}{% endif %}
+          {%   if i.admin is defined %}{% set _ = item.update({'enabled': (i.admin != 'down')}) %}{% endif %}
+          {# speed (including 'auto') — only on Ethernet*, not Mgmt/Port-Channel #}
+          {%   if i.speed is defined and (i.name is match('^Ethernet')) %}
+          {%     set _ = item.update({'speed': i.speed}) %}
+          {%   endif %}
+          {%   if item|length > 1 %}{% set _ = out.append(item) %}{% endif %}
+          {% endfor %}
+          {{ out }}
+
+  # Apply base props with the resource module
+    - name: Apply base interface properties
+      tags: [base]
+      arista.eos.eos_interfaces:
+        config: "{{ _base_cfg }}"
+        state: merged
+      when: _base_cfg | length > 0
+
+    # ---------- L2 using resource modules ----------
+
+  # Build three lists for L2 work, skipping interface Management* (no switchport commands present)
+    - name: Build resource-module configs for L2
+      ansible.builtin.set_fact:
+        _l2_mode_cfg: |
+          {% set out = [] %}
+          {% for i in interfaces_effective %}
+          {%   if (i.name is match('^(Ethernet|Port-Channel)')) and (i.mode in ['access','trunk']) %}
+          {%     set _ = out.append({'name': i.name, 'mode': 'layer2'}) %}
+          {%   endif %}
+          {% endfor %}
+          {{ out }}
+        _l2_access_cfg: |
+          {% set out = [] %}
+          {% for i in interfaces_effective %}
+          {%   if (i.name is match('^(Ethernet|Port-Channel)')) and i.mode == 'access'
+                and (i.vlan is defined) and (i.vlan is number) %}
+          {%     set _ = out.append({'name': i.name, 'mode': 'access', 'access': {'vlan': i.vlan}}) %}
+          {%   endif %}
+          {% endfor %}
+          {{ out }}
+        _l2_trunk_cfg: |
+          {% set out = [] %}
+          {% for i in interfaces_effective %}
+          {%   if (i.name is match('^(Ethernet|Port-Channel)')) and i.mode == 'trunk'
+                and (i.vlan is defined) and (i.vlan is iterable) and (i.vlan | length > 0) %}
+          {%     set uniq = (i.vlan | unique | list | sort) %}
+          {%     set _ = out.append({'name': i.name, 'mode': 'trunk', 'trunk': {'allowed_vlans': uniq}}) %}
+          {%   endif %}
+          {% endfor %}
+          {{ out }}
+
+  # Flatten access+trunk VLANs -> unique, sorted list
+    - name: Compute VLANs to ensure (resource modules)
+      ansible.builtin.set_fact:
+        _all_vlans: >-
+          {{
+            (
+              (_l2_access_cfg | map(attribute='access') | map(attribute='vlan') | list)
+              +
+              (_l2_trunk_cfg  | map(attribute='trunk')  | map(attribute='allowed_vlans') | list | flatten)
+            ) | unique | sort
+          }}
+
+  # Convert ints -> [{'vlan_id': <int>}, ...] for eos_vlans expected shape
+    - name: Build vlan config objects for eos_vlans
+      ansible.builtin.set_fact:
+        _vlans_cfg: |
+          {% set out = [] %}
+          {% for v in _all_vlans %}
+          {%   set _ = out.append({'vlan_id': (v | int)}) %}
+          {% endfor %}
+          {{ out }}
+      when: apply_l2 and (_all_vlans | length > 0)
+
+
+  # Check VLANs exist
+    - name: Ensure VLANs exist
+      tags: [l2]
+      arista.eos.eos_vlans:
+        config: "{{ _vlans_cfg }}"
+        state: merged
+      when: apply_l2 and ((_vlans_cfg | default([])) | length > 0)
+
+
+  # Force layer2 mode where needed (so L2 settings apply cleanly)
+    - name: Force layer2 mode where needed
+      tags: [l2]
+      arista.eos.eos_interfaces:
+        config: "{{ _l2_mode_cfg }}"
+        state: merged
+      when: apply_l2 and (_l2_mode_cfg | length > 0)
+
+  # Apply access ports
+    - name: Apply access ports (resource)
+      tags: [l2]
+      arista.eos.eos_l2_interfaces:
+        config: "{{ _l2_access_cfg }}"
+        state: merged
+      when: apply_l2 and (_l2_access_cfg | length > 0)
+
+  # Apply trunk ports (allowed vlans list)
+    - name: Apply trunk ports (resource)
+      tags: [l2]
+      arista.eos.eos_l2_interfaces:
+        config: "{{ _l2_trunk_cfg }}"
+        state: merged
+      when: apply_l2 and (_l2_trunk_cfg | length > 0)
+
+    # --- DRY-RUN File Output (only when --check) ---
+    - name: Ensure output dir for config file checks
+      tags: [always]                # run even if --tags base/l2 is used
+      check_mode: no                # override check mode so the dir is actually created
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../out"
+        state: directory
+      delegate_to: localhost
+      run_once: true
+      when: ansible_check_mode | bool
+      changed_when: false
+
+    - name: Save intended config to local file (json)
+      tags: [always]                # run regardless of --tags
+      check_mode: no                # override check mode so the file is actually written
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/../out/{{ inventory_hostname }}.json"
+        content: |
+          {
+            "base": {{ (_base_cfg | default([])) | to_nice_json }},
+            "l2_mode": {{ (_l2_mode_cfg | default([])) | to_nice_json }},
+            "l2_access": {{ (_l2_access_cfg | default([])) | to_nice_json }},
+            "l2_trunk": {{ (_l2_trunk_cfg | default([])) | to_nice_json }},
+            "vlans": {{ (_vlans_cfg | default([])) | to_nice_json }}
+          }
+      delegate_to: localhost
+      when: ansible_check_mode | bool
+      changed_when: false
+
+  # --- DRY-RUN CLI Preview (renders intended commands; not executed) ---
+    - name: Render intended CLI preview (string)
+      tags: [always]
+      check_mode: no
+      ansible.builtin.set_fact:
+        _cli_preview: |
+          {% set nl = '\n' %}
+          {% set lines = [] %}
+
+          {# VLAN ensures #}
+          {% for v in _all_vlans | default([]) %}
+          {%   set _ = lines.append("vlan " ~ (v | int)) %}
+          {% endfor %}
+
+          {# Base props (desc/admin/speed) #}
+          {% for i in _base_cfg | default([]) %}
+          {%   set _ = lines.append("interface " ~ i.name) %}
+          {%   if i.description is defined %}{% set _ = lines.append(" description " ~ i.description) %}{% endif %}
+          {%   if i.enabled is defined %}
+          {%     if i.enabled %}{% set _ = lines.append(" no shutdown") %}{% else %}{% set _ = lines.append(" shutdown") %}{% endif %}
+          {%   endif %}
+          {%   if i.speed is defined %}{% set _ = lines.append(" speed " ~ i.speed) %}{% endif %}
+          {%   set _ = lines.append("!") %}
+          {% endfor %}
+
+          {# Access ports #}
+          {% for i in _l2_access_cfg | default([]) %}
+          {%   set _ = lines.append("interface " ~ i.name) %}
+          {%   set _ = lines.append(" switchport") %}
+          {%   set _ = lines.append(" switchport mode access") %}
+          {%   set _ = lines.append(" switchport access vlan " ~ (i.access.vlan | int)) %}
+          {%   set _ = lines.append("!") %}
+          {% endfor %}
+
+          {# Trunk ports #}
+          {% for i in _l2_trunk_cfg | default([]) %}
+          {%   set _ = lines.append("interface " ~ i.name) %}
+          {%   set _ = lines.append(" switchport") %}
+          {%   set _ = lines.append(" switchport mode trunk") %}
+          {%   set _ = lines.append(" switchport trunk allowed vlan " ~ (i.trunk.allowed_vlans | join(','))) %}
+          {%   set _ = lines.append("!") %}
+          {% endfor %}
+
+          {{ lines | join(nl) }}
+
+      when: ansible_check_mode | bool or preview_cli_always | bool
+
+    - name: Write CLI preview to local file
+      tags: [always]
+      check_mode: no
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/../out/{{ inventory_hostname }}.cli"
+        content: "{{ _cli_preview | default('') }}"
+      delegate_to: localhost
+      when: (ansible_check_mode | bool or preview_cli_always | bool) and (_cli_preview | default('') | length > 0)
+      changed_when: false
+
+
+
+    # OPTIONAL PERSIST (safe on hardware; off on cEOS)
+    - name: Persist running-config to startup-config (optional)
+      when: persist | bool
+      block:
+        - name: write memory (text output to avoid JSON parse issues)
+          arista.eos.eos_command:
+            commands:
+              - command: "write memory"
+                output: text
+          register: _save_try
+          ignore_errors: true
+
+        - name: Fallback- copy run start
+          arista.eos.eos_command:
+            commands:
+              - command: "copy running-config startup-config"
+                output: text
+          when: _save_try is failed
