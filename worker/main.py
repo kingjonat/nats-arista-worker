@@ -383,7 +383,7 @@ async def main():
     """
     Connect to NATS, subscribe to 'arista-config', and handle messages as they arrive.
     """
-    nats_url = os.environ.get("NATS_URL", "nats://127.0.0.1:4222")
+    nats_url = os.environ.get("NATS_URL", "nats://ibc-hive.dbbroadcast.co.uk/nats:5050")
     nc = await nats.connect(nats_url)
     print(f"[{WORKER_NAME}] connected to {nats_url}")
 
