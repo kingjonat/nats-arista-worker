@@ -15,7 +15,7 @@ from pydantic import BaseModel, ValidationError
 
 # Constants
 WORKER_NAME = "arista-config-worker"
-
+VERSION = "1.0.0"
 # Project paths
 ROOT = Path(__file__).resolve().parents[1]
 ANSIBLE_DIR = ROOT / "ansible"
