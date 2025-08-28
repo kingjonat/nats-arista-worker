@@ -4,7 +4,7 @@ import os
 import shlex
 import tempfile
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, cast
 import subprocess
 import yaml
 import fnmatch
@@ -47,6 +47,21 @@ class Msg(BaseModel):
     persist: Optional[bool] = False          # Optional: ask playbook to persist (write memory) after changes
     tags: Optional[list[str]] = None
     skip_tags: Optional[list[str]] = None
+
+class Envelope(BaseModel):
+    message_id: str
+    action: Literal["deploy", "verify", "poll", "dump"]
+    payload: dict  # schema varies by action
+
+class PollDevice(BaseModel):
+    name: str
+    ip: str
+    port: Optional[int] = 80
+    # optional ad-hoc list of show commands; defaulted if absent
+    shows: Optional[list[str]] = None
+
+class PollPayload(BaseModel):
+    devices: list[PollDevice]
     
 
 # ───────────────────────────── Inventory shaping ─────────────────────────────
@@ -196,6 +211,19 @@ def _normalise_interfaces(items: list[Interface]) -> list[dict]:
         out.append(d)
     return out
 
+# ----------------------------- Response Helper -----------------------------
+RESP_SUBJECT = "arista-response"
+
+async def publish_response(nc, *, message_id: str, status: str, rc: int, payload: dict):
+    out = {
+        "message_id": message_id,
+        "action": "response",
+        "status": status,     # "success" | "fail"
+        "payload": payload,  
+    }
+    await nc.publish(RESP_SUBJECT, json.dumps(out).encode())
+
+
 # ----------------------------- CLI Diff Pretty Parser ----------------------
 
 def _to_lines(x) -> list[str]:
@@ -313,7 +341,7 @@ def _sanitize_cmd_for_log(argv: list[str]) -> str:
             redacted.append(a)
     return " ".join(shlex.quote(x) for x in redacted)
 
-async def run_play(payload: Msg) -> tuple[int, str, str]:
+async def run_play(payload: Msg, *, dry_run: bool) -> tuple[int, str, str]:
     playbook = ANSIBLE_DIR / "playbooks" / "arista_config.yml"
     inv_path = make_temp_inventory(payload.devices)
     limit_pattern = ":".join([d.name for d in payload.devices])
@@ -338,11 +366,10 @@ async def run_play(payload: Msg) -> tuple[int, str, str]:
         str(playbook),
         "--limit", limit_pattern,
         "--extra-vars", ev_json,
+        "--diff",
     ]
-    if payload.action == "dry_run":
-        argv += ["--check", "--diff"]
-    else:
-        argv += ["--diff"]
+    if dry_run:
+        argv += ["--check"]
     if tags:
         argv += ["--tags", ",".join(tags)]
     if skip_tags:
@@ -374,6 +401,118 @@ async def run_play(payload: Msg) -> tuple[int, str, str]:
     return rc, out, err
 
 
+#------------------------------ POLL FUNCTION ---------------------------------
+async def run_poll(poll: PollPayload) -> tuple[int, str, str]:
+    """
+    Build temp inventory from PollPayload and execute eos_command 'show ... | json'
+    for each device. Returns (rc, stdout, stderr) with Ansible JSON callback.
+    """
+    # Build devices->interfaces empty but we still need creds in inventory
+    devices_for_inv = []
+    for d in poll.devices:
+        devices_for_inv.append(Device(
+            name=d.name, ip=d.ip, port=d.port or 80, interfaces=[]
+        ))
+    inv_path = make_temp_inventory(devices_for_inv)
+    limit_pattern = ":".join([d.name for d in poll.devices])
+
+    # default shows if none supplied
+    default_shows = [
+        "show version",
+        "show interfaces status",
+    ]
+
+    # Build hostvars mapping for per-host show list
+    host_shows = {d.name: (d.shows or default_shows) for d in poll.devices}
+
+    # Write a tiny playbook that uses eos_command with output json
+    fd, pb_path = tempfile.mkstemp(suffix=".yml", prefix="poll_", dir=str(tmpdir))
+    os.close(fd)
+    playbook_text = """\
+- name: Poll EOS show commands
+  hosts: all
+  connection: httpapi
+  gather_facts: no
+  collections: [arista.eos]
+  become: true
+  become_method: enable
+  vars:
+    ansible_network_os: arista.eos.eos
+    ansible_httpapi_use_ssl: false
+    ansible_httpapi_validate_certs: false
+  tasks:
+    - name: Build shows list for host
+      ansible.builtin.set_fact:
+        _shows: "{{ hostvars[inventory_hostname].shows | default(shows | default([])) }}"
+
+    - name: Build eos_command payload (list of dicts)
+      ansible.builtin.set_fact:
+        _cmds: >-
+          {{
+            _shows
+            | map('regex_replace', '^(.*)$', '{\"command\":\"\\1\",\"output\":\"json\"}')
+            | map('from_json')
+            | list
+          }}
+
+    - name: Execute shows (JSON)
+      arista.eos.eos_command:
+        commands: "{{ _cmds }}"
+      register: _poll_out
+      when: _cmds | length > 0
+"""
+
+
+    with open(pb_path, "w", encoding="utf-8") as f:
+        f.write(playbook_text)
+
+    # extra vars inject per-host shows
+    extra_vars = {
+        "shows": None,  # prefer host-level when available
+    }
+    # Build hostvars file to attach shows per host in inventory? We can pass in inventory hosts via make_temp_inventory,
+    # so attach shows under hosts as a key 'shows'
+    # Re-open inventory and add shows into hosts
+    with open(inv_path, "r+", encoding="utf-8") as f:
+        inv = yaml.safe_load(f) or {}
+        hosts = inv.get("all", {}).get("children", {}).get("arista", {}).get("hosts", {})
+        for h, lst in host_shows.items():
+            if h in hosts:
+                hosts[h]["shows"] = lst
+        f.seek(0); f.truncate()
+        yaml.safe_dump(inv, f, sort_keys=False)
+
+    argv = [
+        "ansible-playbook",
+        "-i", str(inv_path),
+        str(pb_path),
+        "--limit", limit_pattern,
+        "--extra-vars", json.dumps(extra_vars),
+    ]
+
+    env = os.environ.copy()
+    env["ANSIBLE_CONFIG"] = str(ANSIBLE_DIR / "ansible.cfg")
+    env["ANSIBLE_STDOUT_CALLBACK"] = "json"
+    env["ANSIBLE_LOAD_CALLBACK_PLUGINS"] = "1"
+
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        cwd=str(ANSIBLE_DIR),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    out_b, err_b = await proc.communicate()
+    rc = await proc.wait()
+    out, err = out_b.decode(errors="replace"), err_b.decode(errors="replace")
+
+    if not os.environ.get("KEEP_INVENTORY"):
+        try: os.remove(inv_path)
+        except Exception: pass
+    try: os.remove(pb_path)
+    except Exception: pass
+
+    return rc, out, err
 
 
 
@@ -383,90 +522,178 @@ async def main():
     """
     Connect to NATS, subscribe to 'arista-config', and handle messages as they arrive.
     """
-    nats_url = os.environ.get("NATS_URL", "nats://ibc-hive.dbbroadcast.co.uk/nats:5050")
-    nc = await nats.connect(nats_url)
+    nats_url = os.environ.get("NATS_URL", "nats://127.0.0.1:5050/nats")
+    nc = await nats.connect(
+    nats_url,
+    max_reconnect_attempts=-1,  # forever
+    reconnect_time_wait=2,
+    ping_interval=20,
+    allow_reconnect=True,
+)
     print(f"[{WORKER_NAME}] connected to {nats_url}")
 
     async def handle(msg):
-        # Parse and validate the JSON payload. If it’s not valid, log and drop.
+        # 1) Parse JSON
         try:
-            payload = Msg(**json.loads(msg.data.decode()))
-        except (json.JSONDecodeError, ValidationError) as e:
-            print("Bad payload:", e)
+            raw = json.loads(msg.data.decode())
+        except json.JSONDecodeError as e:
+            print(f"Bad payload: {e.msg} at line {e.lineno} col {e.colno}")
             return
 
-        # Run the play against just the devices in this message.
-        try:
-            rc, out, err = await run_play(payload)
-        except Exception as e:
-            err_msg = f"worker exception: {type(e).__name__}: {e}"
-            print(f"[{WORKER_NAME}] {err_msg}")
-            result = {
-                "status": "error", "rc": 99, "devices": [d.name for d in payload.devices],
-                "stats": None, "missing_from_stats": [d.name for d in payload.devices],
-                "failed_tasks": None, "stderr_tail": err_msg, "stdout_tail": ""
-            }
-            await nc.publish("deploy.results", json.dumps(result).encode())
+        # 2) Back-compat: if legacy (no message_id), treat as old Msg
+        is_legacy = "message_id" not in raw
+        if is_legacy:
+            message_id = "legacy-" + os.urandom(4).hex()
+            try:
+                payload = Msg(**raw)
+            except ValidationError as e:
+                print("Bad legacy payload:", e)
+                return
+            dry_run = (payload.action == "dry_run")
+            try:
+                rc, out, err = await run_play(payload, dry_run=dry_run)
+            except Exception as e:
+                err_msg = f"worker exception: {type(e).__name__}: {e}"
+                print(f"[{WORKER_NAME}] {err_msg}")
+                await publish_response(nc, message_id=message_id, status="fail", rc=99,
+                                    payload={"error": err_msg})
+                return
+
+            stats = parse_ansible_json_stream(out)
+            failed = extract_failed_tasks(out)
+            diffs = extract_diffs(out)
+            print_human_diffs(diffs, dry_run=dry_run, prefix=WORKER_NAME)
+
+            hostnames = [d.name for d in payload.devices] if payload.devices else []
+            stats_map: dict[str, dict] = cast(dict[str, dict], stats or {})
+            status_ok = (rc in (0, 2)) and all(
+                not ((stats_map.get(h) or {}).get("unreachable", 0) or (stats_map.get(h) or {}).get("failures", 0))
+                for h in hostnames
+            )
+
+            await publish_response(
+                nc,
+                message_id=message_id,
+                status="success" if status_ok else "fail",
+                rc=rc,
+                payload={
+                    "action": payload.action,
+                    "stats": stats, "failed_tasks": failed,
+                    "diffs": diffs, "stderr_tail": err[-3000:], "stdout_tail": out[-6000:]
+                }
+            )
             return
 
+        # 3) New envelope path
+        try:
+            env = Envelope(**raw)
+        except ValidationError as e:
+            print("Bad envelope:", e)
+            return
 
-        stats = parse_ansible_json_stream(out)
+        if env.action in ("deploy", "verify"):
+            # Map envelope.payload -> Msg
+            try:
+                conf = Msg(**{
+                    "action": "dry_run" if env.action == "verify" else "deploy",
+                    **env.payload
+                })
+            except ValidationError as e:
+                print("Bad config payload:", e)
+                await publish_response(nc, message_id=env.message_id, status="fail", rc=98,
+                                    payload={"error": f"payload validation: {e.errors()}"})
+                return
 
-        target_hosts = {d.name for d in payload.devices}
-        bad_hosts = {}
-        missing_from_stats = set()
+            dry_run = (env.action == "verify")
+            try:
+                rc, out, err = await run_play(conf, dry_run=dry_run)
+            except Exception as e:
+                err_msg = f"worker exception: {type(e).__name__}: {e}"
+                print(f"[{WORKER_NAME}] {err_msg}")
+                await publish_response(nc, message_id=env.message_id, status="fail", rc=99,
+                                    payload={"error": err_msg})
+                return
 
-        if stats:
-            for host in target_hosts:
-                if host not in stats:
-                    missing_from_stats.add(host)
-                    continue
-                s = stats[host]
-                unreachable = s.get("unreachable", 0)
-                failures    = s.get("failures", s.get("failed", 0))
-                if unreachable or failures:
-                    bad_hosts[host] = {"unreachable": unreachable, "failures": failures}
+            stats = parse_ansible_json_stream(out)
+            failed = extract_failed_tasks(out)
+            diffs = extract_diffs(out)
+            print_human_diffs(diffs, dry_run=dry_run, prefix=WORKER_NAME)
+
+            # same success heuristic
+            target_hosts = {d.name for d in conf.devices}
+            stats_map: dict[str, dict] = cast(dict[str, dict], stats or {})
+            bad = {}
+            for h in target_hosts:
+                s = stats_map.get(h) or {}
+                if s.get("unreachable", 0) or s.get("failures", 0):
+                    bad[h] = s
+            status_ok = (rc in (0, 2)) and not bad
+
+            await publish_response(
+                nc,
+                message_id=env.message_id,
+                status="success" if status_ok else "fail",
+                rc=rc,
+                payload={
+                    "action": env.action,
+                    "devices": sorted(list(target_hosts)),
+                    "stats": stats, "failed_tasks": failed,
+                    "diffs": diffs,
+                    "stderr_tail": err[-3000:], "stdout_tail": out[-6000:]
+                }
+            )
+            return
+
+        elif env.action == "poll":
+            # Validate poll payload and run
+            try:
+                poll = PollPayload(**env.payload)
+            except ValidationError as e:
+                await publish_response(nc, message_id=env.message_id, status="fail", rc=98,
+                                    payload={"error": f"poll payload validation: {e.errors()}"})
+                return
+            try:
+                rc, out, err = await run_poll(poll)
+            except Exception as e:
+                err_msg = f"worker exception: {type(e).__name__}: {e}"
+                print(f"[{WORKER_NAME}] {err_msg}")
+                await publish_response(nc, message_id=env.message_id, status="fail", rc=99,
+                                    payload={"error": err_msg})
+                return
+
+            # For poll, just return the raw Ansible JSON (stdout_tail) + rc
+            await publish_response(
+                nc,
+                message_id=env.message_id,
+                status="success" if rc in (0, 2) else "fail",
+                rc=rc,
+                payload={
+                    "action": "poll",
+                    "stdout_tail": out[-6000:], "stderr_tail": err[-3000:]
+                }
+            )
+            return
+
+        elif env.action == "dump":
+            # Not implemented yet
+            await publish_response(
+                nc,
+                message_id=env.message_id,
+                status="fail",
+                rc=97,
+                payload={"error": "dump action not implemented"}
+            )
+            return
+
         else:
-            # No JSON stats at all — treat as an error, and include a hint
-            missing_from_stats = target_hosts
+            await publish_response(
+                nc,
+                message_id=env.message_id,
+                status="fail",
+                rc=96,
+                payload={"error": f"unknown action '{env.action}'"}
+            )
 
-        status_ok = (rc in (0, 2)) and not bad_hosts and not missing_from_stats
-        status = "ok" if status_ok else "error"
-        failed = extract_failed_tasks(out)
-
-        diffs = extract_diffs(out)
-        print_human_diffs(diffs, dry_run=(payload.action == "dry_run"), prefix=WORKER_NAME)
-
-
-        result = {
-            "status": status,
-            "rc": rc,
-            "devices": sorted(list(target_hosts)),
-            "stats": stats or None,
-            "missing_from_stats": sorted(list(missing_from_stats)) or None,
-            "failed_tasks": failed or None,  
-            "stderr_tail": err[-3000:],
-            "stdout_tail": out[-6000:]
-        }
-        await nc.publish("deploy.results", json.dumps(result).encode())
-
-        def _t(s: str | None, n: int = 200) -> str:
-            return (s or "").replace("\n", " ")[:n]
-
-        # Console: show why we flagged error
-        if status == "ok":
-            print(f"[{WORKER_NAME}] rc={rc} status=ok devices={sorted(list(target_hosts))}")
-        else:
-             print(f"[{WORKER_NAME}] rc={rc} ERROR bad_hosts={bad_hosts or 'none'} missing={sorted(list(missing_from_stats)) or 'none'}")
-        if failed:
-            for host, items in failed.items():
-                for it in items:
-                    print(
-                        f"[{WORKER_NAME}] FAIL host={host} task='{it.get('task')}' "
-                        f"msg='{_t(it.get('msg'))}' "
-                        f"stderr='{_t(it.get('stderr'))}' "
-                        f"module_stdout='{_t(it.get('module_stdout'))}'"
-                    )
 
 
     # Listen for config requests on this subject.
