@@ -660,7 +660,13 @@ async def main():
                                     payload={"error": err_msg})
                 return
 
-            # For poll, just return the raw Ansible JSON (stdout_tail) + rc
+            # Try to parse stdout into JSON
+            try:
+                parsed = json.loads(out)
+            except json.JSONDecodeError:
+                parsed = out[-6000:]  # fallback to raw string
+
+            # Publish parsed structure instead of escaped string
             await publish_response(
                 nc,
                 message_id=env.message_id,
@@ -668,9 +674,11 @@ async def main():
                 rc=rc,
                 payload={
                     "action": "poll",
-                    "stdout_tail": out[-6000:], "stderr_tail": err[-3000:]
+                    "stdout": parsed,   # structured JSON if possible
+                    "stderr_tail": err[-3000:]
                 }
             )
+
             return
 
         elif env.action == "dump":
