@@ -79,6 +79,7 @@ def make_temp_inventory(devices: list[Device]) -> str:
             "ansible_password": creds["password"],
             "ansible_become_password": creds["enable"],
             "interfaces": _normalise_interfaces(d.interfaces),
+            "interfaces_effective": _normalise_interfaces(d.interfaces),
         }
 
     group_vars = {
@@ -443,7 +444,7 @@ async def run_poll(poll: PollPayload) -> tuple[int, str, str]:
   tasks:
     - name: Build shows list for host
       ansible.builtin.set_fact:
-        _shows: "{{ hostvars[inventory_hostname].shows | default(shows | default([])) }}"
+        _shows: "{{ hostvars[inventory_hostname].shows | default(['show version','show interfaces status']) }}"
 
     - name: Build eos_command payload (list of dicts)
       ansible.builtin.set_fact:
@@ -463,13 +464,11 @@ async def run_poll(poll: PollPayload) -> tuple[int, str, str]:
 """
 
 
+
     with open(pb_path, "w", encoding="utf-8") as f:
         f.write(playbook_text)
 
-    # extra vars inject per-host shows
-    extra_vars = {
-        "shows": None,  # prefer host-level when available
-    }
+    extra_vars = {}
     # Build hostvars file to attach shows per host in inventory? We can pass in inventory hosts via make_temp_inventory,
     # so attach shows under hosts as a key 'shows'
     # Re-open inventory and add shows into hosts
