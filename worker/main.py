@@ -216,6 +216,16 @@ def _normalise_interfaces(items: list[Interface]) -> list[dict]:
         out.append(d)
     return out
 
+
+# JSON helper
+
+def _maybe_json(s: str):
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
 # ----------------------------- Response Helper -----------------------------
 RESP_SUBJECT = "arista-response"
 
@@ -574,17 +584,20 @@ async def main():
                 for h in hostnames
             )
 
-            await publish_response(
-                nc,
-                message_id=message_id,
-                status="success" if status_ok else "fail",
-                rc=rc,
-                payload={
-                    "action": payload.action,
-                    "stats": stats, "failed_tasks": failed,
-                    "diffs": diffs, "stderr_tail": err[-3000:], "stdout_tail": out[-6000:]
-                }
-            )
+            ansible_obj = _maybe_json(out)
+            payload_obj = {
+                "action": payload.action,
+                "stats": stats, "failed_tasks": failed,
+                "diffs": diffs,
+                # If we could parse Ansible’s JSON, return it as an object.
+                # Otherwise include a short raw tail so you still see something.
+                **({"ansible": ansible_obj} if ansible_obj is not None else {"stdout_tail": out[-6000:]}),
+                "stderr_tail": err[-3000:],
+            }
+            await publish_response(nc, message_id=message_id,
+                                status="success" if status_ok else "fail",
+                                rc=rc, payload=payload_obj)
+
             return
 
         # 3) New envelope path
@@ -616,6 +629,7 @@ async def main():
                 await publish_response(nc, message_id=env.message_id, status="fail", rc=99,
                                     payload={"error": err_msg})
                 return
+            
 
             stats = parse_ansible_json_stream(out)
             failed = extract_failed_tasks(out)
@@ -632,19 +646,19 @@ async def main():
                     bad[h] = s
             status_ok = (rc in (0, 2)) and not bad
 
-            await publish_response(
-                nc,
-                message_id=env.message_id,
-                status="success" if status_ok else "fail",
-                rc=rc,
-                payload={
-                    "action": env.action,
-                    "devices": sorted(list(target_hosts)),
-                    "stats": stats, "failed_tasks": failed,
-                    "diffs": diffs,
-                    "stderr_tail": err[-3000:], "stdout_tail": out[-6000:]
-                }
-            )
+            ansible_obj = _maybe_json(out)
+            payload_obj = {
+                "action": env.action,
+                "devices": sorted(list(target_hosts)),
+                "stats": stats, "failed_tasks": failed,
+                "diffs": diffs,
+                **({"ansible": ansible_obj} if ansible_obj is not None else {"stdout_tail": out[-6000:]}),
+                "stderr_tail": err[-3000:],
+            }
+            await publish_response(nc, message_id=env.message_id,
+                                status="success" if status_ok else "fail",
+                                rc=rc, payload=payload_obj)
+
             return
 
         elif env.action == "poll":
