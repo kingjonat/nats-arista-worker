@@ -9,13 +9,15 @@ import subprocess
 import yaml
 import fnmatch
 import difflib
+from shutil import which
 
 import nats
 from pydantic import BaseModel, ValidationError
 
 # Constants
 WORKER_NAME = "arista-config-worker"
-VERSION = "1.0.0"
+ANSIBLE_VAULT_BIN = os.environ.get("ANSIBLE_VAULT_BIN") or which("ansible-vault") or "/opt/hive/apps/arista-worker/.venv/bin/ansible-vault"
+VERSION = "1.1.0"
 # Project paths
 ROOT = Path(__file__).resolve().parents[1]
 ANSIBLE_DIR = ROOT / "ansible"
@@ -158,6 +160,8 @@ def extract_failed_tasks(stdout: str) -> dict[str, list[dict]]:
 def _load_vault_map() -> dict:
     """Return dict with vault_arista_creds from ansible-vault."""
     vf = ANSIBLE_DIR / "group_vars" / "all" / "vault.yml"
+    if not os.path.exists(ANSIBLE_VAULT_BIN):
+        raise RuntimeError(f"ansible-vault not found at '{ANSIBLE_VAULT_BIN}'. Set ANSIBLE_VAULT_BIN or fix PATH.")
     proc = subprocess.run(
         ["ansible-vault", "view", str(vf)],
         cwd=str(ANSIBLE_DIR),
